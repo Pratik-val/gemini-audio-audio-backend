@@ -25,8 +25,9 @@ async def connect_to_mongo():
         logger.info(f"Connected to MongoDB at {MONGODB_URL}")
         
     except Exception as e:
-        logger.error(f"Could not connect to MongoDB: {e}")
-        raise e
+        logger.warning(f"Could not connect to MongoDB ({e}). Falling back to in-memory mode.")
+        Database.client = None
+        Database.database = None
 
 async def close_mongo_connection():
     """Close database connection"""

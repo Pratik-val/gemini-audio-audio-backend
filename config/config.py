@@ -50,7 +50,7 @@ CONFIG = types.LiveConnectConfig(
             # start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
             end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
             prefix_padding_ms=100,
-            silence_duration_ms=1000,
+            silence_duration_ms=350,
         )
     ),
     # Comment out input transcription for now

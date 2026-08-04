@@ -14,6 +14,7 @@ from google import genai
 from google.genai import types
 from config.database import connect_to_mongo, close_mongo_connection, get_database
 from services.call_service import call_service
+from services.telemetry_service import telemetry_service
 from services.audio_buffer import AdaptiveBuffer
 app = FastAPI()
 
@@ -47,6 +48,10 @@ class AudioLoop:
         self.tasks = []
         self.call_completed = False
         self.once=1
+        self.input_audio_bytes = 0
+        self.input_audio_chunks = 0
+        self.output_audio_bytes = 0
+        self.output_audio_chunks = 0
         
         
         
@@ -83,10 +88,41 @@ class AudioLoop:
             self.set_end_time()  # Set end time when saving conversation
             await call_service.add_transcript_and_timestamp(self.call_id, conversation_str, self.start_time, self.end_time)
             logger.info(f"Conversation saved for call ID: {self.call_id}")
+            
+            # Save telemetry and calculate pricing in PostgreSQL
+            duration = (self.end_time - self.start_time) if (self.start_time and self.end_time) else 0.0
+            interview_id = ""
+            candidate_name = ""
+            if isinstance(self.dynamic_data, dict):
+                interview_id = self.dynamic_data.get("interview_id", "")
+                candidate_name = self.dynamic_data.get("name", "")
+            elif isinstance(self.dynamic_data, str):
+                try:
+                    d = json.loads(self.dynamic_data)
+                    interview_id = d.get("interview_id", "")
+                    candidate_name = d.get("name", "")
+                except:
+                    pass
+
+            telemetry_data = {
+                "call_id": self.call_id,
+                "interview_id": interview_id,
+                "interviewer_id": self.agent_id or "",
+                "candidate_name": candidate_name,
+                "input_audio_bytes": self.input_audio_bytes,
+                "output_audio_bytes": self.output_audio_bytes,
+                "input_audio_chunks": self.input_audio_chunks,
+                "output_audio_chunks": self.output_audio_chunks,
+                "call_duration_seconds": duration,
+                "status": "completed"
+            }
+            logger.info(f"Saving telemetry for call_id: {self.call_id} (bytes in: {self.input_audio_bytes}, out: {self.output_audio_bytes})")
+            await telemetry_service.save_telemetry_async(telemetry_data)
+            
             self.conversation = []
             self.call_completed = True
         except Exception as e:
-            logger.error(f"Error saving conversation: {e}")
+            logger.error(f"Error saving conversation: {e}", exc_info=True)
   
    
 
@@ -95,12 +131,16 @@ class AudioLoop:
             try:
                 data = await self.ws.receive()
                 if data['type'] == 'websocket.disconnect':
+                    logger.info("WebSocket disconnect event received. Saving conversation & telemetry...")
+                    await self.save_conversation_and_timestamp()
                     raise WebSocketDisconnect
                 elif data['type'] == 'websocket.receive':
                     if 'bytes' in data:
                         flag, pcm = data['bytes'][0], data['bytes'][1:]
                         if flag == 0x01:  # Mic audio
                             # logger.info(f"Received mic audio: {len(pcm)} bytes")
+                            self.input_audio_bytes += len(pcm)
+                            self.input_audio_chunks += 1
                             self.audio_out_buffer.add_chunk({"data": pcm, "mime_type": "audio/pcm"})
                             self.last_audio_time = time.time()
                     elif 'text' in data:
@@ -118,8 +158,8 @@ class AudioLoop:
                             break
                         text = json_data.get("input", "")
                         if text:
-                            # logger.info(f"Received text input: {text}")
-                            await self.session.send(input=text or ".", end_of_turn=True)
+                            logger.info(f"Sending text input to Gemini: {text}")
+                            await self.session.send_realtime_input(text=text)
                     else:
                         logger.warning(f"Received unknown data type: {data}")
             except WebSocketDisconnect:
@@ -163,7 +203,7 @@ class AudioLoop:
                     input="Interview ended successfully. Goodbye!",
                     end_of_turn=True
                 )
-                self.save_conversation_and_timestamp()
+                await self.save_conversation_and_timestamp()
                 self.tasks[0].cancel()  # Cancel handle_websocket_messages
                 self.tasks[1].cancel()  # Cancel send_audio_to_gemini
                 self.tasks[3].cancel()  
@@ -219,9 +259,9 @@ class AudioLoop:
     async def receive_from_gemini(self):
         try:
             while self.active:
-                turn = self.session.receive()
-                
-                async for response in turn:
+                async for response in self.session.receive():
+                    if not self.active:
+                        break
                     # PRIORITY 0: Critical System Messages - Handle inline
                     if response.session_resumption_update:
                         update = response.session_resumption_update
@@ -231,11 +271,11 @@ class AudioLoop:
                     
                     if hasattr(response, 'go_away') and response.go_away is not None:
                         logger.info(f"Received GoAway message. Time left: {response.go_away.time_left}")
-                        # If we have a handle, we might need to resume, but that's a larger refactor.
-                        # For now, log and continue.
                     
                     # PRIORITY 1: Audio data - immediate forwarding (critical path)
                     if data := response.data:
+                        self.output_audio_bytes += len(data)
+                        self.output_audio_chunks += 1
                         self.audio_in_buffer.add_chunk(data)
                     
                     # PRIORITY 2: Everything else offloaded to background
@@ -381,7 +421,7 @@ class AudioLoop:
                         # start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                         end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
                         prefix_padding_ms=100,
-                        silence_duration_ms=1000,
+                        silence_duration_ms=350,
                     )
                 ),
                 # Comment out input transcription for now
@@ -433,7 +473,7 @@ class AudioLoop:
             async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
                 self.session = session
                 logger.info("Sending initial prompt to Gemini...")
-                await self.session.send(input=f"{self.final_prompt}", end_of_turn=True)
+                await self.session.send_realtime_input(text=f"{self.final_prompt}")
                 logger.info("Initial prompt sent.")
                 self.set_start_time()  # Set start time when session starts
                 
@@ -483,7 +523,7 @@ async def audio_ws(ws: WebSocket, agent_id: str = "default-agent"):
     except WebSocketDisconnect:
         loop.active = False
         try:
-            loop.save_conversation_and_timestamp()
+            await loop.save_conversation_and_timestamp()
             await ws.close()
         except:
             pass
@@ -497,8 +537,16 @@ async def audio_ws(ws: WebSocket, agent_id: str = "default-agent"):
             pass
     finally:
         loop.active = False
+        if not loop.call_completed:
+            try:
+                await loop.save_conversation_and_timestamp()
+            except Exception as e:
+                logger.error(f"Error saving conversation in finally block: {e}")
         if loop.session:
-            await loop.session.close()
+            try:
+                await loop.session.close()
+            except:
+                pass
         for i in loop.tasks:
             i.cancel()
 
@@ -564,6 +612,19 @@ async def get_all_calls():
     # TypeError: object list can't be used in 'await' expression
     calls = await call_service.get_all_calls()
     return {"calls": calls}
+
+@app.get("/api/telemetry")
+async def get_all_telemetry():
+    """Get all telemetry records with price details from PostgreSQL"""
+    return {"telemetry": telemetry_service.get_all_telemetry()}
+
+@app.get("/api/telemetry/{call_id}")
+async def get_telemetry_by_call_id(call_id: str):
+    """Get telemetry by call_id from PostgreSQL"""
+    res = telemetry_service.get_telemetry(call_id)
+    if not res:
+        return {"message": "Telemetry not found."}
+    return res
 
 if __name__ == "__main__":
     import uvicorn
