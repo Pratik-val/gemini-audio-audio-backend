@@ -1,0 +1,62 @@
+# .github/workflows/deploy.yml
+# CI/CD for the gemini-audio backend -> Cloud Run (asia-south1).
+# Requires repo secrets:
+#   - GCP_SA_KEY : JSON key of github-actions-deployer-212@nxthyre.iam.gserviceaccount.com
+#   - (Secrets GEMINI_API_KEY and DATABASE_URL must already exist in Secret Manager)
+
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: nxthyre
+  REGION: asia-south1
+  SERVICE: nxthyre-audio
+  IMAGE: asia-south1-docker.pkg.dev/nxthyre/nxthyre-server-images/gemini-audio:latest
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (SA key)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker asia-south1-docker.pkg.dev
+
+      - name: Build and Push Image
+        run: |
+          docker build -t $IMAGE .
+          docker push $IMAGE
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: nxthyre-audio
+          image: ${{ env.IMAGE }}
+          region: ${{ env.REGION }}
+          flags: |
+            --allow-unauthenticated
+            --min-instances=1
+            --timeout=3600
+            --memory=1Gi
+            --set-secrets=GEMINI_API_KEY=GEMINI_API_KEY:latest
+            --set-secrets=DATABASE_URL=DATABASE_URL:latest

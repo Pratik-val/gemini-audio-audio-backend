@@ -7,9 +7,9 @@ import psycopg2
 
 logger = logging.getLogger(__name__)
 
-# Default Database connection string with URL-encoded password
-DEFAULT_PG_URL = "postgres://nxthyre_admin:valnxthyre%402*2S@34.93.148.194:5432/nxthyre_dev_db"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_PG_URL)
+# Database connection string is read from environment (DATABASE_URL).
+# Never hardcode credentials; keep them in Secret Manager / env.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # Pricing parameters for Gemini Live API (Audio to Audio)
 # Audio Input: $3.00 / 1,000,000 tokens ($0.0000030 / token)

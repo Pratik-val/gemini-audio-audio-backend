@@ -1,0 +1,35 @@
+# cloudbuild.yaml
+# Builds the gemini-audio backend image and deploys to Cloud Run (asia-south1).
+
+substitutions:
+  _REGION: asia-south1
+  _SERVICE: nxthyre-audio
+  _REPO: asia-south1-docker.pkg.dev/nxthyre/nxthyre-server-images
+  _IMAGE: ${_REPO}/gemini-audio:latest
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', '${_IMAGE}', '.']
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_IMAGE}']
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE}'
+      - '--image'
+      - '${_IMAGE}'
+      - '--region'
+      - '${_REGION}'
+      - '--allow-unauthenticated'
+      - '--min-instances=1'
+      - '--timeout=3600'
+      - '--memory=1Gi'
+      - '--set-secrets=GEMINI_API_KEY=GEMINI_API_KEY:latest'
+      - '--set-secrets=DATABASE_URL=DATABASE_URL:latest'
+
+images:
+  - '${_IMAGE}'

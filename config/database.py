@@ -1,40 +1,42 @@
 # config/database.py
 import os
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import ConnectionFailure
 import logging
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 logger = logging.getLogger(__name__)
 
-class Database:
-    client: AsyncIOMotorClient = None
-    database = None
+# Cloud SQL (PostgreSQL) configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+SCHEMA_SQL_PATH = os.getenv("DB_SCHEMA_SQL", "db/schema.sql")
 
-# MongoDB configuration
-MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-DATABASE_NAME = os.getenv("DATABASE_NAME", "interview_db")
 
-async def connect_to_mongo():
-    """Create database connection"""
+def get_connection():
+    """Return a psycopg2 connection with dict cursor, or None if DB unreachable."""
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL not set. Falling back to in-memory mode.")
+        return None
     try:
-        Database.client = AsyncIOMotorClient(MONGODB_URL, serverSelectionTimeoutMS=2000)
-        Database.database = Database.client[DATABASE_NAME]
-        
-        # Test the connection
-        await Database.client.admin.command('ping')
-        logger.info(f"Connected to MongoDB at {MONGODB_URL}")
-        
+        return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     except Exception as e:
-        logger.warning(f"Could not connect to MongoDB ({e}). Falling back to in-memory mode.")
-        Database.client = None
-        Database.database = None
+        logger.warning(f"Could not connect to PostgreSQL ({e}). Falling back to in-memory mode.")
+        return None
 
-async def close_mongo_connection():
-    """Close database connection"""
-    if Database.client:
-        Database.client.close()
-        logger.info("Disconnected from MongoDB")
 
-def get_database():
-    """Get database instance"""
-    return Database.database
+def init_db():
+    """Create required tables if they do not exist. Safe to call on startup."""
+    conn = get_connection()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            if os.path.exists(SCHEMA_SQL_PATH):
+                with open(SCHEMA_SQL_PATH, "r", encoding="utf-8") as f:
+                    cur.execute(f.read())
+                conn.commit()
+                logger.info("Database schema initialized.")
+            else:
+                logger.warning(f"Schema file not found at {SCHEMA_SQL_PATH}; skipping init.")
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to initialize database schema: {e}")

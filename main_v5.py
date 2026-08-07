@@ -12,7 +12,7 @@ from config.config import CONFIG, MODEL, SEND_SR, RECV_SR, CHUNK, client, end_ca
 from config.prompts import general_interviewer_prompt
 from google import genai
 from google.genai import types
-from config.database import connect_to_mongo, close_mongo_connection, get_database
+from config.database import init_db
 from services.call_service import call_service
 from services.telemetry_service import telemetry_service
 from services.audio_buffer import AdaptiveBuffer
@@ -558,16 +558,15 @@ async def root():
     return {"message": "WebSocket server is running. Connect to /ws/audio for audio processing."}
 
 
-#connect to mongo on startup
+#connect to Cloud SQL on startup
 @app.on_event("startup")
 async def startup_event():
-    await connect_to_mongo()
-    logger.info("Connected to MongoDB on startup.")
+    await asyncio.to_thread(init_db)
+    logger.info("Database schema check complete on startup.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await close_mongo_connection()
-    logger.info("Disconnected from MongoDB on shutdown.")
+    logger.info("Shutting down audio backend.")
 
 class RegisterCallRequest(BaseModel):
     interviewer_id: str
@@ -628,4 +627,5 @@ async def get_telemetry_by_call_id(call_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=9000)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -1,0 +1,11 @@
+.venv/
+venv/
+.env
+.git/
+__pycache__/
+*.pyc
+.gitignore
+IMPLEMENTATION_PLAN.md
+sample_client.html
+final_prompt.txt
+requirements-dev.txt
