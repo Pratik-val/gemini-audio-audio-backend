@@ -332,6 +332,16 @@ class AudioLoop:
         
         interviewer_personality = "professional, friendly, and encouraging"
         
+        # Check if caller provided a complete pre-constructed system prompt
+        incoming_prompt = json_data.get("system_prompt") or json_data.get("prompt")
+        
+        if incoming_prompt and isinstance(incoming_prompt, str) and incoming_prompt.strip():
+            logger.info("Using custom system_prompt received from client dynamic_data")
+            base_prompt = incoming_prompt
+        else:
+            logger.info("Using default general_interviewer_prompt fallback")
+            base_prompt = self.general_interviewer_prompt
+
         # Extract and parse questions
         questions_data = json_data.get("questions", [])
         if isinstance(questions_data, str):
@@ -339,21 +349,24 @@ class AudioLoop:
                 questions_data = json.loads(questions_data)
             except json.JSONDecodeError:
                 questions_data = []
-                logger.error("Error: Could not parse questions as JSON. Using empty list.")
-        
-        # Format questions and follow-ups
+
+        # Format questions and follow-ups if template replacements are needed
         formatted_questions = ""
-        for idx, q in enumerate(questions_data, 1):
-            main_question = q.get("question", "")
-            follow_ups = q.get("follow_ups", [])
-            formatted_questions += f"{idx}. {main_question}\n"
-            if follow_ups:
-                formatted_questions += "   Follow-up questions:\n"
-                for f_idx, follow_up in enumerate(follow_ups, 1):
-                    formatted_questions += f"     {f_idx}. {follow_up}\n"
-            formatted_questions += "\n"
-        
-        # Define replacements for the prompt
+        if isinstance(questions_data, list):
+            for idx, q in enumerate(questions_data, 1):
+                if isinstance(q, dict):
+                    main_question = q.get("question", "")
+                    follow_ups = q.get("follow_ups", [])
+                    formatted_questions += f"{idx}. {main_question}\n"
+                    if follow_ups:
+                        formatted_questions += "   Follow-up questions:\n"
+                        for f_idx, follow_up in enumerate(follow_ups, 1):
+                            formatted_questions += f"     {f_idx}. {follow_up}\n"
+                    formatted_questions += "\n"
+        elif isinstance(questions_data, str):
+            formatted_questions = questions_data
+
+        # Define replacements for remaining placeholders if any exist
         replacements = {
             "{{role}}": json_data.get("role", ""),
             "{{mins}}": json_data.get("mins", ""),
@@ -368,8 +381,7 @@ class AudioLoop:
             "{{questions}}": formatted_questions
         }
         
-        # Replace placeholders in the general prompt
-        final_prompt = self.general_interviewer_prompt
+        final_prompt = base_prompt
         for placeholder, value in replacements.items():
             final_prompt = final_prompt.replace(placeholder, str(value))
         
@@ -380,10 +392,7 @@ class AudioLoop:
         """
         
         self.final_prompt = final_prompt + tool_instruction
-        
-        # Write the final prompt to a file for debugging
-        # with open("final_prompt.txt", "w", encoding="utf-8") as f:
-        #     f.write(self.final_prompt)
+
             
     async def resume_session(self):
         """Resume the session if it was interrupted."""
