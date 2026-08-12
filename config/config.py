@@ -63,6 +63,9 @@ CONFIG = types.LiveConnectConfig(
     ),
     tools=[end_call_tool],
     system_instruction=types.Content(parts=[types.Part(text="TRANSCRIBE ONLY IN ENGLISH, NO OTHER LANGUAGES")]),
+    context_window_compression=types.ContextWindowCompressionConfig(
+        sliding_window=types.SlidingWindow()
+    ),
     session_resumption=types.SessionResumptionConfig(
         handle=None
     )
