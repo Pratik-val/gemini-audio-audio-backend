@@ -47,6 +47,8 @@ class AudioLoop:
         self.task_group = None
         self.tasks = []
         self.call_completed = False
+        self.should_reconnect = False
+        self.gemini_tasks = []
         self.once=1
         self.input_audio_bytes = 0
         self.input_audio_chunks = 0
@@ -132,38 +134,39 @@ class AudioLoop:
                 data = await self.ws.receive()
                 if data['type'] == 'websocket.disconnect':
                     logger.info("WebSocket disconnect event received. Saving conversation & telemetry...")
+                    self.active = False
+                    self.call_completed = True
                     await self.save_conversation_and_timestamp()
                     raise WebSocketDisconnect
                 elif data['type'] == 'websocket.receive':
                     if 'bytes' in data:
                         flag, pcm = data['bytes'][0], data['bytes'][1:]
                         if flag == 0x01:  # Mic audio
-                            # logger.info(f"Received mic audio: {len(pcm)} bytes")
                             self.input_audio_bytes += len(pcm)
                             self.input_audio_chunks += 1
                             self.audio_out_buffer.add_chunk({"data": pcm, "mime_type": "audio/pcm"})
                             self.last_audio_time = time.time()
                     elif 'text' in data:
                         json_data = json.loads(data['text'])
-                        # logger.info(f"Received JSON data: {json_data}")
                         if json_data.get("action") == "end_call":
                             logger.info("Received end_call action")
                             self.active = False
+                            self.call_completed = True
                             await self.save_conversation_and_timestamp()
-                            await self.ws.close()
-                            self.tasks[2].cancel()  # Cancel handle_websocket_messages
-                            self.tasks[1].cancel()  # Cancel send_audio_to_gemini
-                            self.tasks[3].cancel()  
-                            asyncio.current_task().cancel()  # Cancel receive_from_gemini
+                            try:
+                                await self.ws.close()
+                            except Exception:
+                                pass
                             break
                         text = json_data.get("input", "")
-                        if text:
+                        if text and self.session:
                             logger.info(f"Sending text input to Gemini: {text}")
                             await self.session.send_realtime_input(text=text)
                     else:
                         logger.warning(f"Received unknown data type: {data}")
             except WebSocketDisconnect:
                 self.active = False
+                self.call_completed = True
                 break
             except Exception as e:
                 logger.error(f"Error in handle_websocket_messages: {e}")
@@ -172,14 +175,16 @@ class AudioLoop:
 
     async def send_audio_to_gemini(self):
         try:
-            while self.active:
+            while self.active and not self.should_reconnect:
                 msg = await self.audio_out_buffer.get_chunk()
-                if msg:
-                    # logger.info(f"Sending audio to Gemini: {len(msg['data'])} bytes")
+                if msg and self.session:
                     await self.session.send_realtime_input(audio=msg)
+        except asyncio.CancelledError:
+            pass
         except Exception as e:
             logger.error(f"Error in send_audio_to_gemini: {e}")
-            self.active = False
+            if self.session_handle:
+                self.should_reconnect = True
 
     async def handle_function_call(self, function_call):
         """Handle function calls from Gemini"""
@@ -199,23 +204,14 @@ class AudioLoop:
                 })
                 
                 # Send function response back to Gemini
-                await self.session.send(
-                    input="Interview ended successfully. Goodbye!",
-                    end_of_turn=True
-                )
-                await self.save_conversation_and_timestamp()
-                self.tasks[0].cancel()  # Cancel handle_websocket_messages
-                self.tasks[1].cancel()  # Cancel send_audio_to_gemini
-                self.tasks[3].cancel()  
-                asyncio.current_task().cancel()  # Cancel receive_from_gemini
-                
-                # Set active to False to stop all loops
+                if self.session:
+                    await self.session.send(
+                        input="Interview ended successfully. Goodbye!",
+                        end_of_turn=True
+                    )
                 self.active = False
-
-                
-                # Close the websocket
-                # await self.ws.close()
-                
+                self.call_completed = True
+                await self.save_conversation_and_timestamp()
                 return True
             
             return False
@@ -258,9 +254,9 @@ class AudioLoop:
 
     async def receive_from_gemini(self):
         try:
-            while self.active:
+            while self.active and not self.should_reconnect:
                 async for response in self.session.receive():
-                    if not self.active:
+                    if not self.active or self.should_reconnect:
                         break
                     # PRIORITY 0: Critical System Messages - Handle inline
                     if response.session_resumption_update:
@@ -270,7 +266,9 @@ class AudioLoop:
                             logger.info(f"Session handle updated to: {self.session_handle}")
                     
                     if hasattr(response, 'go_away') and response.go_away is not None:
-                        logger.info(f"Received GoAway message. Time left: {response.go_away.time_left}")
+                        logger.info(f"Received GoAway message (time_left: {response.go_away.time_left}). Triggering session resumption...")
+                        self.should_reconnect = True
+                        break
                     
                     # PRIORITY 1: Audio data - immediate forwarding (critical path)
                     if data := response.data:
@@ -288,6 +286,8 @@ class AudioLoop:
             logger.info("receive_from_gemini cancelled")
         except Exception as e:
             logger.error(f"Error in receive_from_gemini: {e}")
+            if self.session_handle:
+                self.should_reconnect = True
 
 
 
@@ -394,119 +394,103 @@ class AudioLoop:
         self.final_prompt = final_prompt + tool_instruction
 
             
-    async def resume_session(self):
-        """Resume the session if it was interrupted."""
-        try:
-            # 1) Close old session so the SDK stops its internal loops
-            if self.session is not None:
-                try:
-                    await self.session.close()
-                except Exception as e:
-                    logger.error(f"Error closing old session: {e}")
-
-            # 2) Cancel *only* your four background tasks
-            # if self.tasks:
-            #     logger.info("Cancelling previous session tasks…")
-            #     for task in self.tasks:
-            #         if not task.done():
-            #             try:
-            #                 task.cancel()
-            #             except RecursionError:
-            #                 pass
-            #     await asyncio.gather(*self.tasks, return_exceptions=True)
-            #     self.tasks = []
-
-            # 3) Reconfigure and reconnect
-            CONFIGR = types.LiveConnectConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="puck"),
-                    )
-                ),
-                realtime_input_config=types.RealtimeInputConfig(
-                    automatic_activity_detection=types.AutomaticActivityDetection(
-                        disabled=False,
-                        # start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
-                        end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
-                        prefix_padding_ms=100,
-                        silence_duration_ms=350,
-                    )
-                ),
-                # Comment out input transcription for now
-                input_audio_transcription=types.AudioTranscriptionConfig(),
-                output_audio_transcription=types.AudioTranscriptionConfig(),
-                generation_config=types.GenerationConfig(
-                    temperature=0.7,
-                    top_p=0.95,
-                    top_k=70
-                ),
-                tools=[end_call_tool],
-                system_instruction=types.Content(parts=[types.Part(text="TRANSCRIBE ONLY IN ENGLISH, NO OTHER LANGUAGES")]),
-                context_window_compression=types.ContextWindowCompressionConfig(
-                    sliding_window=types.SlidingWindow()
-                ),
-                session_resumption=types.SessionResumptionConfig(
-                    handle=self.session_handle
-                )
-            )
-
-            # logger.info(f"Resuming session with config: {CONFIGR}")
-
-            async with client.aio.live.connect(model=MODEL, config=CONFIGR) as session:
-                self.session = session
-                # await self.session.send(input=f"{self.final_prompt}", end_of_turn=True)
-                self.active = True
-                t1 = asyncio.create_task(self.handle_websocket_messages())
-                t2 = asyncio.create_task(self.send_audio_to_gemini())
-                t3 = asyncio.create_task(self.receive_from_gemini())
-                t4 = asyncio.create_task(self.play_audio())
-                    # tg.create_task(self.monitor_silence())
-                self.tasks = [t1, t2, t3, t4]
-                for task in self.tasks:
-                    await task
-                    
-                logger.info("Session resumed and initial prompt sent.")
-             
-        except asyncio.CancelledError:
-            logger.warning("Session cancelled")
-            while self.call_completed is False:
-                await self.resume_session()
-        except Exception as e:
-            logger.error(f"Error in AudioLoop: {e}", exc_info=True)
-        finally:
-            self.active = False
-            self.call_completed = True
-            logger.info("AudioLoop finished")
-
-
     async def run(self):
+        self.set_start_time()
+        
+        # Start persistent WebSocket message listener and audio player for the client
+        ws_task = asyncio.create_task(self.handle_websocket_messages())
+        play_task = asyncio.create_task(self.play_audio())
+        
+        prompt_sent = False
+
         try:
-            async with client.aio.live.connect(model=MODEL, config=CONFIG) as session:
-                self.session = session
-                logger.info("Sending initial prompt to Gemini...")
-                await self.session.send_realtime_input(text=f"{self.final_prompt}")
-                logger.info("Initial prompt sent.")
-                self.set_start_time()  # Set start time when session starts
+            while self.active and not self.call_completed:
+                self.should_reconnect = False
                 
-                
-                t1 = asyncio.create_task(self.handle_websocket_messages())
-                t2 = asyncio.create_task(self.send_audio_to_gemini())
-                t3 = asyncio.create_task(self.receive_from_gemini())
-                t4 = asyncio.create_task(self.play_audio())
-                    # tg.create_task(self.monitor_silence())
-                self.tasks = [t1, t2, t3, t4]
-                for task in self.tasks:
-                    await task
-            
-        except asyncio.CancelledError:
-            logger.warning("Session cancelled")
-            while self.call_completed is False:
-                await self.resume_session()
-        except Exception as e:
-            logger.error(f"Error in AudioLoop: {e}", exc_info=True)
+                if self.session_handle is None:
+                    config = CONFIG
+                else:
+                    logger.info(f"Resuming Gemini session with handle: {self.session_handle}")
+                    config = types.LiveConnectConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types.SpeechConfig(
+                            voice_config=types.VoiceConfig(
+                                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="puck"),
+                            )
+                        ),
+                        realtime_input_config=types.RealtimeInputConfig(
+                            automatic_activity_detection=types.AutomaticActivityDetection(
+                                disabled=False,
+                                prefix_padding_ms=100,
+                                silence_duration_ms=350,
+                            )
+                        ),
+                        input_audio_transcription=types.AudioTranscriptionConfig(),
+                        output_audio_transcription=types.AudioTranscriptionConfig(),
+                        generation_config=types.GenerationConfig(
+                            temperature=0.7,
+                            top_p=0.95,
+                            top_k=70
+                        ),
+                        tools=[end_call_tool],
+                        system_instruction=types.Content(parts=[types.Part(text="TRANSCRIBE ONLY IN ENGLISH, NO OTHER LANGUAGES")]),
+                        context_window_compression=types.ContextWindowCompressionConfig(
+                            sliding_window=types.SlidingWindow()
+                        ),
+                        session_resumption=types.SessionResumptionConfig(
+                            handle=self.session_handle
+                        )
+                    )
+
+                try:
+                    async with client.aio.live.connect(model=MODEL, config=config) as session:
+                        self.session = session
+                        
+                        if not prompt_sent:
+                            logger.info("Sending initial prompt to Gemini...")
+                            await self.session.send_realtime_input(text=f"{self.final_prompt}")
+                            logger.info("Initial prompt sent.")
+                            prompt_sent = True
+                        else:
+                            logger.info("Gemini session reconnected/resumed successfully.")
+
+                        t_send = asyncio.create_task(self.send_audio_to_gemini())
+                        t_recv = asyncio.create_task(self.receive_from_gemini())
+                        
+                        self.gemini_tasks = [t_send, t_recv]
+                        
+                        done, pending = await asyncio.wait(
+                            self.gemini_tasks,
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        
+                        for t in pending:
+                            t.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+
+                        if self.should_reconnect and self.active and not self.call_completed:
+                            logger.info("Session resumption triggered. Reconnecting Gemini session...")
+                            await asyncio.sleep(0.1)
+                            continue
+                        else:
+                            break
+                except asyncio.CancelledError:
+                    logger.warning("Gemini session cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in Gemini session loop: {e}", exc_info=True)
+                    if self.session_handle and self.active and not self.call_completed:
+                        logger.info("Attempting to resume session after error...")
+                        await asyncio.sleep(0.5)
+                        continue
+                    else:
+                        break
+
         finally:
             self.active = False
+            ws_task.cancel()
+            play_task.cancel()
+            await asyncio.gather(ws_task, play_task, return_exceptions=True)
             logger.info("AudioLoop finished")
             
             
