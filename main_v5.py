@@ -350,18 +350,18 @@ class AudioLoop:
             except json.JSONDecodeError:
                 questions_data = []
 
-        # Format questions and follow-ups if template replacements are needed
+        # Format questions and follow-ups cleanly
         formatted_questions = ""
         if isinstance(questions_data, list):
             for idx, q in enumerate(questions_data, 1):
                 if isinstance(q, dict):
                     main_question = q.get("question", "")
                     follow_ups = q.get("follow_ups", [])
-                    formatted_questions += f"{idx}. {main_question}\n"
+                    formatted_questions += f"Main Question {idx}: {main_question}\n"
                     if follow_ups:
-                        formatted_questions += "   Follow-up questions:\n"
+                        formatted_questions += "  (Optional follow-ups to ask ONLY in a separate subsequent turn after candidate responds):\n"
                         for f_idx, follow_up in enumerate(follow_ups, 1):
-                            formatted_questions += f"     {f_idx}. {follow_up}\n"
+                            formatted_questions += f"    - {follow_up}\n"
                     formatted_questions += "\n"
         elif isinstance(questions_data, str):
             formatted_questions = questions_data
@@ -391,7 +391,20 @@ class AudioLoop:
         IMPORTANT: You have access to an 'end_interview_call' function. Use this function ONLY when the candidate explicitly asks to end the interview or says they want to stop (e.g., "let's end the interview", "I want to stop now", "end the interview", "that's all for today"). Do not use this function for any other reason.
         """
         
-        self.final_prompt = final_prompt + tool_instruction
+        strict_one_question_mandate = """
+        
+        ================================================================================
+        ABSOLUTE MANDATE - STRICT ONE QUESTION PER TURN:
+        ================================================================================
+        1. YOU MUST ASK EXACTLY ONE QUESTION PER RESPONSE TURN. ZERO EXCEPTIONS.
+        2. NEVER ASK 2, 3, OR 4 QUESTIONS AT THE SAME TIME IN A SINGLE TURN.
+        3. NEVER COMBINE A MAIN QUESTION WITH ITS FOLLOW-UP QUESTIONS OR THE NEXT QUESTION.
+        4. AFTER ASKING ONE QUESTION, STOP SPEAKING IMMEDIATELY AND WAIT FOR THE CANDIDATE'S RESPONSE.
+        5. ONLY AFTER THE CANDIDATE COMPLETES THEIR ANSWER SHOULD YOU ACKNOWLEDGE BRIEFLY AND ASK THE NEXT SINGLE QUESTION.
+        ================================================================================
+        """
+        
+        self.final_prompt = final_prompt + tool_instruction + strict_one_question_mandate
 
             
     async def run(self):
